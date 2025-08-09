@@ -17,7 +17,7 @@ https://e.tb.cn/h.hqEcjVPNn9dCe1D?tk=QfsT47fU4dW MF287 「EFH-08E12W-JP01 14CM�
 0. 打开blender，创建script
 1. 粘贴 https://github.com/tqtb89/amd-instinct-mi-fan-adapter/blob/main/blender.script 的内容
 2. 运行
-3. 在场景中选中所有物体
+3. 在场景列表中选中所有物体
 4. 导出->stl->勾选selection only和apply modifiers
 5. 使用3d打印机打印，开启支撑
 
