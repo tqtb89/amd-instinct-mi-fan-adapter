@@ -1,0 +1,501 @@
+import bpy
+import itertools
+import math
+
+def clear_scene():
+    """
+    Clears the entire Blender scene, deleting all objects and collections except the master scene collection.
+    """
+    if bpy.context.active_object and bpy.context.active_object.mode == 'EDIT':
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+    # Create a copy of the list of all objects to delete
+    objects_to_delete = list(bpy.data.objects)
+
+    # Iterate over the copied list and remove each object from the original data
+    for obj in objects_to_delete:
+        bpy.data.objects.remove(obj, do_unlink=True)
+        
+    print(f"Operation complete: Successfully deleted {len(objects_to_delete)} objects.")
+
+    # (Optional) Purge all orphan data (meshes, materials, etc.)
+    try:
+        bpy.ops.outliner.orphans_purge()
+        print("All orphan data has been purged.")
+    except RuntimeError:
+        print("Could not automatically purge orphan data outside of Outliner context, but all objects were deleted.")
+    
+    
+    scene_collection = bpy.context.scene.collection
+
+    # Create a copy of the list of all collections to iterate over
+    collections_to_delete = list(bpy.data.collections)
+
+    deleted_count = 0
+    print("Starting to clean up collections...")
+
+    # Iterate over the copied list
+    for coll in collections_to_delete:
+        # Skip the protected scene root collection
+        if coll == scene_collection:
+            print(f"- Skipping protected scene root collection: '{coll.name}'")
+            continue
+    
+        # For all other collections, perform the deletion
+        try:
+            # Check if the collection still exists (it might have been deleted with its parent)
+            if coll.name in bpy.data.collections:
+                print(f"- Deleting collection: '{coll.name}'")
+                bpy.data.collections.remove(coll)
+                deleted_count += 1
+        except Exception as e:
+            # Catch potential errors, though unlikely after the check
+            print(f"Error while deleting '{coll.name}': {e}")
+
+
+clear_scene()
+
+def create_polygon_object(verts_mm: list, object_name: str, thickness_mm: float):
+    """
+    Creates a thin polygon object with a specified thickness from vertices given in millimeters.
+    """
+    # Convert input millimeter vertex data to Blender's internal meter units
+    verts_m = [[coord / 1000.0 for coord in v] for v in verts_mm]
+    
+    mesh = bpy.data.meshes.new(name=f"{object_name}_Mesh")
+    obj = bpy.data.objects.new(name=object_name, object_data=mesh)
+    bpy.context.collection.objects.link(obj)
+    
+    # Create the polygon using vertices in meter units
+    face_indices = [list(range(len(verts_m)))]
+    mesh.from_pydata([[v[0], v[1], 0] for v in verts_m], [], face_indices)
+    mesh.update()
+
+    # Add a Solidify modifier for the bottom face and convert thickness from mm to meters
+    if thickness_mm > 0:
+        modifier = obj.modifiers.new(name="BottomSolidify", type='SOLIDIFY')
+        modifier.thickness = thickness_mm / 1000.0 # Core fix: convert mm thickness to meters
+        modifier.offset = -1 # Make the thickness grow downwards, keeping the top face at Z=0
+        modifier.use_even_offset = True
+
+    return obj
+
+def create_thin_walls_from_polygon(verts_mm: list, object_name: str, height_mm: float, thickness_mm: float):
+    """
+    Creates thin walls with a specified height and thickness from vertices given in millimeters.
+    """
+    # Convert input millimeter vertex data to Blender's internal meter units
+    verts_m = [[coord / 1000.0 for coord in v] for v in verts_mm]
+    
+    mesh = bpy.data.meshes.new(name=f"{object_name}_Walls_Mesh")
+    obj = bpy.data.objects.new(name=object_name, object_data=mesh)
+    bpy.context.collection.objects.link(obj)
+
+    # Create edges from the vertices in meter units
+    edges = [(i, (i + 1) % len(verts_m)) for i in range(len(verts_m))]
+    mesh.from_pydata([[v[0], v[1], 0] for v in verts_m], edges, [])
+    mesh.update()
+
+    # Enter Edit Mode to perform extrusion
+    bpy.context.view_layer.objects.active = obj
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_all(action='SELECT')
+    
+    # Core fix: convert extrusion height from mm to meters
+    bpy.ops.mesh.extrude_region_move(TRANSFORM_OT_translate={"value": (0, 0, height_mm / 1000.0)})
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    # Add a Solidify modifier
+    modifier = obj.modifiers.new(name="WallSolidify", type='SOLIDIFY')
+    # Core fix: convert wall thickness from mm to meters
+    modifier.thickness = thickness_mm / 1000.0
+    modifier.offset = 0
+    modifier.use_even_offset = True
+
+    return obj
+
+def draw_circle_mm(x_mm, y_mm, r_mm, d1_deg, d2_deg, points):
+    """Generates points forming a circular arc (unit: millimeters)."""
+    arc_points = []
+    angle_step = (d2_deg - d1_deg) / (points - 1)
+    for i in range(points):
+        current_angle_deg = d1_deg + i * angle_step
+        current_angle_rad = math.radians(current_angle_deg)
+        point_x_mm = x_mm + r_mm * math.cos(current_angle_rad)
+        point_y_mm = y_mm + r_mm * math.sin(current_angle_rad)
+        arc_points.append([point_x_mm, point_y_mm])
+    return arc_points
+
+def get_or_create_cutters_collection():
+    """--- NEW --- Helper to get or create a dedicated collection for cutter objects."""
+    collection_name = "Cutter Objects"
+    if collection_name in bpy.data.collections:
+        return bpy.data.collections[collection_name]
+    else:
+        new_collection = bpy.data.collections.new(collection_name)
+        bpy.context.scene.collection.children.link(new_collection)
+        return new_collection
+    
+def subtract_cuboids(target_obj, cuboids_data_mm: list):
+    """
+    Creates cuboids and subtracts them from a target object using boolean modifiers.
+    The cuboids are positioned and rotated around their base center.
+    """
+    bpy.ops.object.select_all(action='DESELECT')
+    cutter_objects = []
+    cutters_collection = get_or_create_cutters_collection()
+
+    for i, cuboid_mm in enumerate(cuboids_data_mm):
+        # 1. 从输入数据中提取底面中心、尺寸和旋转角度
+        base_center_m = [coord / 1000.0 for coord in cuboid_mm[:3]]
+        dimensions_m = [dim / 1000.0 for dim in cuboid_mm[3:6]]
+        rotation_deg = cuboid_mm[6:9] if len(cuboid_mm) >= 9 else [0, 0, 0]
+        
+        # 旋转顺序从 cuboid_mm 中提取，如果不存在则默认为 'XYZ'
+        rotation_order = 'XYZ'
+        
+        rotation_rad = [math.radians(angle) for angle in rotation_deg]
+        
+        # 2. 在世界原点创建一个基础立方体
+        bpy.ops.mesh.primitive_cube_add(
+            size=1.0, enter_editmode=False, align='WORLD',
+            location=(0, 0, 0), rotation=(0, 0, 0)
+        )
+        cutter_obj = bpy.context.active_object
+        cutter_obj.name = f"Cutter_Cuboid_{target_obj.name}_{i+1}"
+        
+        # 3. 设置物体的尺寸
+        cutter_obj.scale = [d for d in dimensions_m]
+        
+        # 4. 进入编辑模式，将物体的枢轴点移动到底面中心
+        half_height = dimensions_m[2] / 2.0
+        
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='SELECT')
+        bpy.ops.transform.translate(value=(0, 0, -half_height))
+        bpy.ops.object.mode_set(mode='OBJECT')
+        
+        # 应用变换，使新的位置成为物体的“零点”
+        bpy.ops.object.transform_apply(location=True, rotation=False, scale=True)
+        
+        # 5. 设置物体的旋转模式和旋转，旋转将围绕新的枢轴点（底面中心）进行
+        cutter_obj.rotation_mode = rotation_order
+        cutter_obj.rotation_euler = rotation_rad
+
+        # 6. 设置物体的最终位置
+        cutter_obj.location = base_center_m
+
+        cutter_obj.display_type = 'WIRE'
+        cutter_obj.hide_render = True
+        cutter_objects.append(cutter_obj)
+        
+        # 7. 为目标物体添加布尔修改器
+        boolean_mod = target_obj.modifiers.new(name=f"Boolean_Cuboid_{i+1}", type='BOOLEAN')
+        boolean_mod.operation = 'DIFFERENCE'
+        boolean_mod.object = cutter_obj
+        boolean_mod.solver = 'EXACT'
+
+    # 8. 将切割物体移动到专门的集合中
+    for cutter in cutter_objects:
+        if cutter.name in bpy.context.scene.collection.objects:
+            bpy.context.scene.collection.objects.unlink(cutter)
+        if cutter.name not in cutters_collection.objects:
+            cutters_collection.objects.link(cutter)
+
+    # 9. 最终设置
+    bpy.context.view_layer.objects.active = target_obj
+    target_obj.select_set(True)
+    print(f"--- Added {len(cuboids_data_mm)} cuboid subtraction operations to '{target_obj.name}' ---")
+
+
+# --- NEW FUNCTION ---
+def subtract_cylinders(target_obj, cylinders_data_mm: list):
+    """
+    Creates cylinders and subtracts them from a target object to create holes.
+
+    :param target_obj: The object to subtract from.
+    :param cylinders_data_mm: List of cylinder data [x, y, z, r, d, rot_z]
+                              (center_x, center_y, center_z, radius, depth, rot_z_degrees) in mm.
+    """
+    bpy.ops.object.select_all(action='DESELECT')
+    cutter_objects = []
+    cutters_collection = get_or_create_cutters_collection() # Use helper for consistency
+
+    for i, cylinder_mm in enumerate(cylinders_data_mm):
+        center_m = [coord / 1000.0 for coord in cylinder_mm[:3]]
+        radius_m = cylinder_mm[3] / 1000.0
+        depth_m = cylinder_mm[4] / 1000.0
+        rotation_z_deg = cylinder_mm[5] if len(cylinder_mm) > 5 else 0.0
+        rotation_z_rad = math.radians(rotation_z_deg)
+
+        bpy.ops.mesh.primitive_cylinder_add(
+            vertices=164, radius=radius_m, depth=depth_m,
+            enter_editmode=False, align='WORLD',
+            location=center_m, rotation=(0, 0, rotation_z_rad)
+        )
+        cutter_obj = bpy.context.active_object
+        cutter_obj.name = f"Cutter_Cylinder_{target_obj.name}_{i+1}"
+        cutter_obj.display_type = 'WIRE'
+        cutter_obj.hide_render = True
+        cutter_objects.append(cutter_obj)
+        
+        boolean_mod = target_obj.modifiers.new(name=f"Boolean_Cylinder_{i+1}", type='BOOLEAN')
+        boolean_mod.operation = 'DIFFERENCE'
+        boolean_mod.object = cutter_obj
+        boolean_mod.solver = 'EXACT'
+
+    for cutter in cutter_objects:
+        if cutter.name in bpy.context.scene.collection.objects:
+            bpy.context.scene.collection.objects.unlink(cutter)
+        if cutter.name not in cutters_collection.objects:
+            cutters_collection.objects.link(cutter)
+
+    bpy.context.view_layer.objects.active = target_obj
+    target_obj.select_set(True)
+    print(f"--- Added {len(cylinders_data_mm)} cylinder subtraction operations to '{target_obj.name}' ---")
+
+def create_rotated_cuboid(object_name: str, center_mm: list, dimensions_mm: list, rotation_deg: list, rotation_order: str = 'XYZ'):
+    """
+    在指定位置创建一个具有完整旋转和尺寸的长方体。
+
+    :param object_name: 要创建的物体的名称。
+    :param center_mm: 长方体的中心点 [x, y, z] (单位: 毫米)。
+    :param dimensions_mm: 长方体的尺寸 [宽(w), 高(h), 深(d)] (单位: 毫米)。
+    :param rotation_deg: 围绕各轴的旋转角度 [a, b, c] 或 [rot_x, rot_y, rot_z] (单位: 度)。
+    :param rotation_order: 欧拉旋转顺序 (例如 'XYZ', 'ZYX', 'YXZ' 等)。
+    """
+    # 1. 将输入单位 (毫米和度) 转换为Blender内部单位 (米和弧度)
+    center_m = [c / 1000.0 for c in center_mm]
+    dimensions_m = [d / 1000.0 for d in dimensions_mm]
+    rotation_rad = [math.radians(angle) for angle in rotation_deg]
+
+    # 2. 在指定位置创建一个基础立方体
+    bpy.ops.mesh.primitive_cube_add(
+        size=1.0,  # 初始大小为1，方便后续设置尺寸
+        enter_editmode=False,
+        align='WORLD',
+        location=center_m,
+        rotation=(0, 0, 0) # 初始旋转为0，我们将手动设置
+    )
+    cuboid_obj = bpy.context.active_object
+    
+    # 3. 设置物体的名称、尺寸和旋转属性
+    cuboid_obj.name = object_name
+    cuboid_obj.dimensions = dimensions_m
+    
+    # --- 关键步骤: 设置旋转模式和欧拉角 ---
+    cuboid_obj.rotation_mode = rotation_order
+    cuboid_obj.rotation_euler = rotation_rad
+
+    # 4. (可选) 将其设为活动对象并选中
+    bpy.context.view_layer.objects.active = cuboid_obj
+    cuboid_obj.select_set(True)
+    
+    print(f"--- 已创建长方体: '{object_name}' ---")
+    return cuboid_obj
+
+    
+# --- Example Usage ---
+# 1. Set scene units (this primarily affects the UI display)
+bpy.context.scene.unit_settings.system = 'METRIC'
+bpy.context.scene.unit_settings.length_unit = 'MILLIMETERS'
+
+# 2. Define all parameters (in millimeters)
+coordinate_data_mm = [
+    #[0, 0],
+    [52, 14.5],
+    [52, 44.5],
+    [0, 44.5],
+    [10, 19 + 43],
+    [10, 19 + 43 + 2],
+    draw_circle_mm(36, 95, 40, -132, -170, 30),
+    draw_circle_mm(38-0.5, 96+0.5, 42, -190, -270, 30),
+    draw_circle_mm(41-0.5, 92-0.4, 47, -270, -360, 30),
+    [86, 14.5],
+]
+
+# Flatten the nested list of coordinates
+flat_coordinates_mm = list(itertools.chain.from_iterable(
+    item if isinstance(item[0], list) else [item] for item in coordinate_data_mm
+))
+
+object_name = "Final_Shape"
+height_mm = 11.0
+wall_thickness_mm = 1.0
+bottom_thickness_mm = 1.0 # Thickness of the thin bottom face
+
+# =================================================================
+# MODIFIED: Define the array of cuboids to subtract
+# Format: [ centerX, centerY, centerZ, width(X), height(Y), depth(Z), rotation_Z_degrees ] in mm
+# =================================================================
+cuboids_to_subtract_mm = [
+    #[0, 23, height_mm, 3, 7, 2, 0],      
+    [86, 23, height_mm, 3, 7, 2, 0], 
+       
+    [-3+0.2, 105, height_mm, 3, 7, 2, 0, 90, -10],     
+    [67-0.2, 130-0.2, height_mm, 3, 7, 2, 0, 90, 55+180],     
+    
+    [24.4, 44.5, height_mm, 54, 3, 12, 0, 0, 0, 0],    
+    [86, 31.5, 6, 10, 38, 35, 0, 90, 0, 0],    
+    
+    [27, 48, 0, 38, 17, 4, 0, 180, 0, 0],
+    #[38, 48, 0, 8, 4, 4, 0, 180, 0, 0],
+]
+
+# 3. Create the objects
+# Create the bottom face
+bottom_object = create_polygon_object(flat_coordinates_mm, f"{object_name}_Bottom", bottom_thickness_mm)
+
+# Create the walls
+wall_object = create_thin_walls_from_polygon(flat_coordinates_mm, f"{object_name}_Walls", height_mm, wall_thickness_mm)
+
+# --- (Optional) Join the bottom and walls for unified boolean operations ---
+# If you want the holes to cut through both the walls and the bottom, it's best to join them first.
+# 1. Deselect all objects
+# bpy.ops.object.select_all(action='DESELECT')
+# 2. Select the bottom and walls
+# bottom_object.select_set(True)
+# wall_object.select_set(True)
+# 3. Set the wall as the active object (the joined object will keep its name and modifiers)
+# bpy.context.view_layer.objects.active = wall_object
+# 4. Join the objects
+# bpy.ops.object.join()
+# # After joining, wall_object becomes the combined object
+# main_object = wall_object
+
+
+# 4. Subtract the cuboids from the wall object
+# If you joined the objects, replace wall_object with main_object
+subtract_cuboids(wall_object, cuboids_to_subtract_mm)
+# You can also perform the same operation on the bottom object (if not joined)
+subtract_cuboids(bottom_object, cuboids_to_subtract_mm)
+
+cylinders_to_subtract_mm = [
+    # A 5mm radius, 5mm deep hole at the origin (x=0, y=0, z=0)
+    # The depth is large enough to ensure it cuts cleanly through the bottom plate.
+    [34-0.7, 93+0.3, 0, 30, 15, 0] 
+]
+
+subtract_cylinders(bottom_object, cylinders_to_subtract_mm)
+
+
+
+pad1 = create_rotated_cuboid(
+    object_name="MyRotatedCuboid",
+    center_mm=[91-0.6, 42, 16],    dimensions_mm=[7,6,17],
+    rotation_deg=[0,0,0],
+    rotation_order='XYZ' # 明确指定旋转顺序
+)
+
+pad2 = create_rotated_cuboid(
+    object_name="MyRotatedCuboid",
+    center_mm=[91-1.6, 42, 9+0.3],    dimensions_mm=[5,6,18.5],
+    rotation_deg=[0,0,0],
+    rotation_order='XYZ' # 明确指定旋转顺序
+)
+
+def create_rotated_cuboid_from_base(object_name: str, base_center_mm: list, dimensions_mm: list, rotation_deg: list, rotation_order: str = 'XYZ'):
+    """
+    在指定底面中心位置创建一个具有完整旋转和尺寸的长方体。
+
+    :param object_name: 要创建的物体的名称。
+    :param base_center_mm: 长方体的底面中心点 [x, y, z] (单位: 毫米)。
+    :param dimensions_mm: 长方体的尺寸 [宽(w), 高(h), 深(d)] (单位: 毫米)。
+    :param rotation_deg: 围绕各轴的旋转角度 [a, b, c] 或 [rot_x, rot_y, rot_z] (单位: 度)。
+    :param rotation_order: 欧拉旋转顺序 (例如 'XYZ', 'ZYX', 'YXZ' 等)。
+    """
+    base_center_m = [c / 1000.0 for c in base_center_mm]
+    dimensions_m = [d / 1000.0 for d in dimensions_mm]
+    rotation_rad = [math.radians(angle) for angle in rotation_deg]
+
+    # 2. 在世界原点创建一个基础立方体
+    bpy.ops.mesh.primitive_cube_add(
+        size=1.0,
+        enter_editmode=False,
+        align='WORLD',
+        location=(0, 0, 0),
+        rotation=(0, 0, 0)
+    )
+    cuboid_obj = bpy.context.active_object
+    cuboid_obj.name = object_name
+    
+    # 3. 设置物体的尺寸
+    # 注意：这里我们直接设置尺寸，因为下一步我们会调整枢轴点
+    cuboid_obj.scale = [d / 1000.0 for d in dimensions_mm]
+    
+    # 4. 进入编辑模式，将物体的枢轴点移动到底面中心
+    # 计算需要移动的距离，即长方体高度的一半
+    half_height = dimensions_m[2] / 2.0
+    
+    # 获取物体的本地矩阵
+    matrix_world = cuboid_obj.matrix_world
+    
+    # 移动网格数据（mesh data），而不是物体本身
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.transform.translate(value=(0, 0, -half_height))
+    bpy.ops.object.mode_set(mode='OBJECT')
+    
+    # 应用变换，使新的位置成为物体的“零点”
+    bpy.ops.object.transform_apply(location=True, rotation=False, scale=True)
+    
+    # 5. 设置物体的旋转模式和旋转，旋转将围绕新的枢轴点进行
+    cuboid_obj.rotation_mode = rotation_order
+    cuboid_obj.rotation_euler = rotation_rad
+
+    # 6. 设置物体的最终位置
+    cuboid_obj.location = base_center_m
+    
+    # 7. (可选) 将其设为活动对象并选中
+    bpy.context.view_layer.objects.active = cuboid_obj
+    cuboid_obj.select_set(True)
+    
+    print(f"--- 已创建长方体: '{object_name}'，底面中心位于 ({base_center_mm[0]}mm, {base_center_mm[1]}mm, {base_center_mm[2]}mm) ---")
+    return cuboid_obj
+
+
+bar_obj = create_rotated_cuboid_from_base(
+    object_name="MyRotatedCuboid",
+    base_center_mm=[-3, 105, height_mm + 1],    dimensions_mm=[6,8,3],
+    rotation_deg=[0,90,-10],
+    rotation_order='XYZ' # 明确指定旋转顺序
+)
+
+bar_obj2 = create_rotated_cuboid_from_base(
+    object_name="MyRotatedCuboid",
+    base_center_mm=[67-0.15, 130-0.15, height_mm + 1],    dimensions_mm=[6,8,3],
+    rotation_deg=[0,90,55+180],
+    rotation_order='XYZ' # 明确指定旋转顺序
+)
+bar_obj3 = create_rotated_cuboid_from_base(
+    object_name="MyRotatedCuboid",
+    base_center_mm=[86, 23, height_mm + 1],    dimensions_mm=[6,8,3],
+    rotation_deg=[0,90,180],
+    rotation_order='XYZ' # 明确指定旋转顺序
+)
+subtract_cuboids(bar_obj, [
+
+    [-3+0.2, 105, height_mm, 3, 7, 2, 0, 90, -10], 
+    [-3+0.2, 105, height_mm +6, 12, 12, 1, 0, 90, -10], 
+    [-3+0.2, 105, height_mm+2-0.5, 3.5, 7, 10, 0, 90, -10], 
+    ])
+subtract_cuboids(bar_obj2, [
+
+    [67-0.2, 130-0.2, height_mm, 3, 7, 2, 0, 90, 55+180], 
+    [67-0.4, 130-0.4, height_mm+6, 12, 12, 1.2, 0, 90,  55+180], 
+    [67-0.2, 130-0.2, height_mm+2-0.5, 3.5, 7, 10, 0, 90,  55+180], 
+    ])
+
+subtract_cuboids(bar_obj3, [
+
+    [86-0.1, 23, height_mm, 3, 7, 2, 0, 90, 0+180], 
+    [86-0.1, 23, height_mm+6, 12, 12, 1.2, 0, 90,  0+180], 
+    [86, 23, height_mm+2-0.5, 3.5, 7, 10, 0, 90,  0+180], 
+    ])
+
+sm = create_rotated_cuboid_from_base(
+    object_name="sm",
+    base_center_mm=[0.3, 40, height_mm-2],    dimensions_mm=[4,12,1],
+    rotation_deg=[0,-90,0],
+    rotation_order='XYZ' # 明确指定旋转顺序
+)
