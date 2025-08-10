@@ -337,6 +337,7 @@ cuboids_to_subtract_mm = [
     
     [24.4, 44.5, height_mm, 54, 3, 12, 0, 0, 0, 0],    
     [86, 31.5, 6, 10, 38, 35, 0, 90, 0, 0],    
+    [89, 20.5, 0, 4, 15, 39, 0, 90, 0, 0],    
     
     [27, 48, 0, 38, 17, 4, 0, 180, 0, 0],
     #[38, 48, 0, 8, 4, 4, 0, 180, 0, 0],
@@ -382,7 +383,7 @@ subtract_cylinders(bottom_object, cylinders_to_subtract_mm)
 
 pad1 = create_rotated_cuboid(
     object_name="MyRotatedCuboid",
-    center_mm=[91-0.6, 42, 16],    dimensions_mm=[7,6,17],
+    center_mm=[91-0.6, 42, 16],    dimensions_mm=[7,6,18.5],
     rotation_deg=[0,0,0],
     rotation_order='XYZ' # 明确指定旋转顺序
 )
