@@ -34,4 +34,4 @@ https://github.com/tqtb89/amd-instinct-mi-fan-adapter/blob/main/adapter.stl
 2. 安装顶部卡扣
 3. 安装最粗边的卡扣
 
-（安装风扇时会被一个凸起的卡扣挡住，剪掉即可）
+（风扇插入显卡时会被一个凸起的卡扣挡住，剪掉即可）
